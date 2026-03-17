@@ -1,0 +1,160 @@
+import crypto from 'crypto';
+import jwt from 'jsonwebtoken';
+import bcrypt from 'bcryptjs';
+import AppError from '../utils/app-error.js';
+import User from '../models/user.js';
+import RefreshToken from '../models/refresh-token.js';
+
+const ACCESS_TOKEN_EXPIRES = process.env.JWT_ACCESS_EXPIRES || '15m';
+const REFRESH_TOKEN_EXPIRES_DAYS = parseInt(process.env.JWT_REFRESH_EXPIRES_DAYS) || 7;
+
+const signAccessToken = (userId) => {
+    return jwt.sign(
+        { id: userId, type: 'access' },
+        process.env.JWT_SECRET,
+        { expiresIn: ACCESS_TOKEN_EXPIRES }
+    );
+};
+
+const generateRefreshToken = () => {
+    return crypto.randomBytes(64).toString('hex');
+};
+
+const hashToken = (token) => {
+    return crypto.createHash('sha256').update(token).digest('hex');
+};
+
+export async function generateTokenPair(userId, family = null) {
+    const accessToken = signAccessToken(userId);
+    const refreshToken = generateRefreshToken();
+    const hashedRefreshToken = hashToken(refreshToken);
+
+    const tokenFamily = family || crypto.randomBytes(16).toString('hex');
+
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + REFRESH_TOKEN_EXPIRES_DAYS);
+
+    await RefreshToken.create({
+        user_id: userId,
+        token: hashedRefreshToken,
+        family: tokenFamily,
+        expires_at: expiresAt,
+    });
+
+    return {
+        accessToken,
+        refreshToken,
+        accessTokenExpiresIn: ACCESS_TOKEN_EXPIRES,
+        refreshTokenExpiresIn: `${REFRESH_TOKEN_EXPIRES_DAYS}d`,
+    };
+}
+
+export async function signup(userData) {
+    const existingUser = await User.findByEmail(userData.email);
+    if (existingUser) {
+        throw AppError.badRequest('USER_EXISTS', 'User with this email already exists');
+    }
+    delete userData.passwordConfirm;
+
+    const hashedPassword = await bcrypt.hash(userData.password, 12);
+
+    const newUser = await User.create({ ...userData, password: hashedPassword });
+
+    const tokens = await generateTokenPair(newUser.id);
+
+    delete newUser.password;
+
+    return { user: newUser, ...tokens };
+}
+
+export async function login(email, password) {
+    const user = await User.findByEmail(email);
+    if (!user) {
+        throw AppError.unauthorized('INVALID_CREDENTIALS', 'Incorrect email or password');
+    }
+
+    const isPasswordCorrect = await bcrypt.compare(password, user.password);
+    if (!isPasswordCorrect) {
+        throw AppError.unauthorized('INVALID_CREDENTIALS', 'Incorrect email or password');
+    }
+
+    const tokens = await generateTokenPair(user.id);
+
+    delete user.password;
+
+    return { user, ...tokens };
+}
+
+export async function refreshTokens(refreshToken) {
+    const hashedToken = hashToken(refreshToken);
+
+    const storedToken = await RefreshToken.findByToken(hashedToken);
+
+    if (!storedToken) {
+        throw AppError.unauthorized('INVALID_TOKEN', 'Invalid or expired refresh token');
+    }
+
+    if (new Date(storedToken.expires_at) < new Date()) {
+        await RefreshToken.revokeById(storedToken.id);
+        throw AppError.unauthorized('TOKEN_EXPIRED', 'Refresh token has expired');
+    }
+
+    const user = await User.findById(storedToken.user_id);
+    if (!user) {
+        await RefreshToken.revokeFamily(storedToken.family);
+        throw AppError.unauthorized('USER_NOT_FOUND', 'User no longer exists');
+    }
+
+    await RefreshToken.revokeById(storedToken.id);
+
+    const tokens = await generateTokenPair(user.id, storedToken.family);
+
+    delete user.password;
+
+    return { user, ...tokens };
+}
+
+export async function logout(refreshToken) {
+    if (!refreshToken) {
+        return { message: 'Logged out successfully' };
+    }
+
+    const hashedToken = hashToken(refreshToken);
+    await RefreshToken.revokeByToken(hashedToken);
+
+    return { message: 'Logged out successfully' };
+}
+
+export async function logoutAll(userId) {
+    await RefreshToken.revokeAllByUserId(userId);
+    return { message: 'Logged out from all devices successfully' };
+}
+
+export function verifyAccessToken(token) {
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        if (decoded.type !== 'access') {
+            throw AppError.unauthorized('INVALID_TOKEN', 'Invalid token type');
+        }
+        return decoded;
+    } catch (error) {
+        if (error.name === 'TokenExpiredError') {
+            throw AppError.unauthorized('TOKEN_EXPIRED', 'Access token has expired');
+        }
+        if (error.name === 'JsonWebTokenError') {
+            throw AppError.unauthorized('INVALID_TOKEN', 'Invalid access token');
+        }
+        throw error;
+    }
+}
+
+export async function handleTokenReuse(refreshToken) {
+    const hashedToken = hashToken(refreshToken);
+
+    const token = await RefreshToken.findById(hashedToken);
+    if (token) {
+        await RefreshToken.revokeFamily(token.family);
+    }
+
+    throw AppError.unauthorized('TOKEN_REUSE', 'Token reuse detected. Please login again.');
+}

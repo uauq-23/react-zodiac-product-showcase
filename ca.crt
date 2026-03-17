@@ -1,0 +1,32 @@
+import express from 'express';
+import cors from 'cors';
+import helmet from 'helmet';
+import { requestContext } from './middlewares/request-context.js';
+import { accessLogger } from './middlewares/access-logger.js';
+import { responseHelpers } from './middlewares/response-helpers.js';
+import todoRouter from './routers/todo-r.js';
+import authRouter from './routers/auth-r.js';
+// Swagger Documentation
+import { mountSwagger } from './docs/mount-swagger.js';
+
+const app = express();
+
+// Middleware
+app.use(helmet());
+app.use(cors());
+app.use(express.json());
+
+// gài request context middleware để attach requestId và logger
+app.use(requestContext());
+// gài access logger middleware
+app.use(accessLogger());
+app.use(responseHelpers);
+
+// Routes
+app.use('/api/v1/auth', authRouter);
+app.use('/api/todos', todoRouter);
+
+// Swagger Documentation
+mountSwagger(app);
+
+export default app;

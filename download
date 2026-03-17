@@ -1,0 +1,91 @@
+import db from '../db/db.js';
+const TABLE_NAME = 'todos';
+const dbInstance = db(TABLE_NAME);
+
+function applyFilters(qb, { userId, status, q, dueFrom, dueTo, createdFrom, createdTo }) {
+    qb.where("user_id", userId);
+
+    if (status) qb.andWhere("status", status);
+
+    if (q) {
+        // Postgres: ILIKE
+        qb.andWhere((inner) => {
+            inner.whereRaw("title ILIKE ?", [`%${q}%`]).orWhereRaw("description ILIKE ?", [`%${q}%`]);
+        });
+    }
+
+    if (dueFrom) qb.andWhere("due_date", ">=", dueFrom);
+    if (dueTo) qb.andWhere("due_date", "<=", dueTo);
+
+    if (createdFrom) qb.andWhere("created_at", ">=", createdFrom);
+    if (createdTo) qb.andWhere("created_at", "<=", createdTo);
+}
+
+function applySort(qb, sort) {
+    const s = sort || "-created_at";
+    const desc = s.startsWith("-");
+    const col = desc ? s.slice(1) : s;
+    qb.orderBy(col, desc ? "desc" : "asc");
+}
+
+export default {
+    all: async () => {
+        return dbInstance.clone().select('*');
+    },
+    findById: async ({ id }) => {
+        return dbInstance.clone().where({ id }).first();
+    },
+    allByUserId: async ({ userId }) => {
+        return dbInstance.clone().where({ user_id: userId }).select('*');
+    },
+    findByIdAndUserId: async ({ id, userId }) => {
+        return dbInstance.clone().where({ id, user_id: userId }).first();
+    },
+    create: async ({ userId, data }) => {
+        const [newTodo] = await dbInstance.clone()
+            .insert({ ...data, user_id: userId })
+            .returning('*');
+        return newTodo;
+    },
+    update: async ({ id, data }) => {
+        const [updatedTodo] = await dbInstance.clone()
+            .where({ id })
+            .update({ ...data, updated_at: db.fn.now() })
+            .returning('*');
+        return updatedTodo;
+    },
+    delete: async (id) => {
+        return dbInstance.clone().where({ id }).del();
+    },
+    listOffset: async ({ userId, filters, sort, fields, limit, offset }) => {
+        const base = dbInstance.clone().modify(applyFilters, { userId, ...filters });
+
+        // total count
+        const [{ count }] = await base.clone().count({ count: "*" });
+        const total = Number(count) || 0;
+
+        // data
+        const cols = (fields?.length ? fields : ["*"]);
+        const items = await base
+            .clone()
+            .select(cols)
+            .modify(applySort, sort)
+            .limit(limit)
+            .offset(offset);
+
+        return { items, total };
+    },
+    listCursor: async ({ userId, filters, fields, limit, afterId }) => {
+        const cols = (fields?.length ? fields : ["*"]);
+
+        const qb = dbInstance.clone()
+            .select(cols)
+            .modify(applyFilters, { userId, ...filters })
+            .andWhere("id", ">", afterId)
+            .orderBy("id", "asc")
+            .limit(limit);
+
+        const items = await qb;
+        return { items };
+    },
+};
